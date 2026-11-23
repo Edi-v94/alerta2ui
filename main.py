@@ -1,7 +1,9 @@
 """Alerta2UI - alerta quando um dispositivo cadastrado fica fora do ar."""
+import base64
 import ctypes
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -22,6 +24,7 @@ import comtypes.client
 import customtkinter as ctk
 import pystray
 from comtypes import CLSCTX_ALL
+from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image
 from ping3 import ping
 from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
@@ -29,7 +32,8 @@ from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
 # --- CAMINHOS ---
 APPDATA_DIR = os.path.join(os.getenv("APPDATA"), "Alerta2UI")
 os.makedirs(APPDATA_DIR, exist_ok=True)
-ARQUIVO_CONFIG = os.path.join(APPDATA_DIR, "config.json")
+ARQUIVO_CONFIG = os.path.join(APPDATA_DIR, "config.dat")  # criptografado com DPAPI
+ARQUIVO_CONFIG_ANTIGO = os.path.join(APPDATA_DIR, "config.json")  # versões antigas, em texto puro
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,22 +67,84 @@ config = {"som": "", "volume": 100, "iniciar_windows": False, "dispositivos": []
           "senha_hash": "", "senha_sal": ""}
 
 
+# Criptografia DPAPI do Windows: só o mesmo usuário do Windows, neste computador, consegue abrir.
+# Não há chave no código-fonte; ela é gerenciada pelo próprio Windows.
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+_ENTROPIA_DPAPI = b"Alerta2UI-config-v1"
+
+
+def _blob(dados):
+    buf = ctypes.create_string_buffer(dados, len(dados))
+    return _DATA_BLOB(len(dados), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf
+
+
+def _dpapi(func, dados):
+    entrada, _b1 = _blob(dados)
+    entropia, _b2 = _blob(_ENTROPIA_DPAPI)
+    saida = _DATA_BLOB()
+    if not func(ctypes.byref(entrada), None, ctypes.byref(entropia), None, None, 0x1, ctypes.byref(saida)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(saida.pbData, saida.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(saida.pbData)
+
+
+def criptografar(dados):
+    return _dpapi(ctypes.windll.crypt32.CryptProtectData, dados)
+
+
+def descriptografar(dados):
+    return _dpapi(ctypes.windll.crypt32.CryptUnprotectData, dados)
+
+
 def carregar_config():
     if os.path.exists(ARQUIVO_CONFIG):
         try:
-            with open(ARQUIVO_CONFIG, encoding="utf-8") as f:
-                config.update(json.load(f))
+            with open(ARQUIVO_CONFIG, "rb") as f:
+                config.update(json.loads(descriptografar(f.read()).decode("utf-8")))
         except Exception as e:
-            logging.error(f"Falha ao ler configuração: {e}")
+            # Ex.: arquivo copiado de outro usuário/PC. Guarda o arquivo em vez de sobrescrevê-lo.
+            reserva = f"{ARQUIVO_CONFIG}.invalido-{int(time.time())}"
+            logging.error(f"Falha ao abrir configuração ({e}); arquivo movido para {reserva}")
+            os.replace(ARQUIVO_CONFIG, reserva)
+    elif os.path.exists(ARQUIVO_CONFIG_ANTIGO):
+        # Migra a configuração em texto puro para o formato criptografado e apaga a versão aberta
+        try:
+            with open(ARQUIVO_CONFIG_ANTIGO, encoding="utf-8") as f:
+                config.update(json.load(f))
+            salvar_config()
+            os.remove(ARQUIVO_CONFIG_ANTIGO)
+            logging.info("Configuração migrada para o formato criptografado.")
+        except Exception as e:
+            logging.error(f"Falha ao migrar configuração antiga: {e}")
 
 
 def salvar_config():
-    with open(ARQUIVO_CONFIG, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
+    dados = criptografar(json.dumps(config, ensure_ascii=False).encode("utf-8"))
+    temporario = ARQUIVO_CONFIG + ".tmp"
+    with open(temporario, "wb") as f:
+        f.write(dados)
+    os.replace(temporario, ARQUIVO_CONFIG)  # troca atômica: não corrompe se faltar energia
+
+
+CHAVE_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def startup_windows_ativo():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CHAVE_RUN) as chave:
+            winreg.QueryValueEx(chave, "Alerta2UI")
+            return True
+    except OSError:
+        return False
 
 
 def configurar_startup_windows(ativar):
-    chave_run = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    chave_run = CHAVE_RUN
     exe = sys.executable
     if exe.lower().endswith(("python.exe", "pythonw.exe")):
         pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
@@ -691,22 +757,59 @@ def abrir_dispositivo(d=None, copia=False):
 
 
 # --- BACKUP ---
-def exportar_backup(destino):
-    """Gera um .zip com config.json (dispositivos, configurações, senha) e o arquivo de som."""
+# Formato .a2ubak: MAGICO + sal (16 bytes) + token Fernet (AES-128-CBC + HMAC-SHA256) de um .zip com
+# config.json e o som. A chave vem da senha do backup (PBKDF2), então ele pode ser restaurado em
+# qualquer computador, ao contrário do config.dat (DPAPI), que só abre no mesmo usuário/PC.
+MAGICO_BACKUP = b"A2UIBAK1"
+EXTENSAO_BACKUP = ".a2ubak"
+
+
+def _chave_backup(senha, sal):
+    chave = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), sal, 390_000, dklen=32)
+    return base64.urlsafe_b64encode(chave)
+
+
+def backup_criptografado(origem):
+    with open(origem, "rb") as f:
+        return f.read(len(MAGICO_BACKUP)) == MAGICO_BACKUP
+
+
+def exportar_backup(destino, senha):
+    """Gera o backup criptografado com config (dispositivos, configurações, senha de acesso) e o som."""
     dados = dict(config)
     som = config.get("som", "")
-    with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED) as zf:
+    memoria = io.BytesIO()
+    with zipfile.ZipFile(memoria, "w", zipfile.ZIP_DEFLATED) as zf:
         if som and os.path.exists(som):
             dados["som"] = os.path.basename(som)  # caminho muda de máquina para máquina
             zf.write(som, "som/" + os.path.basename(som))
         else:
             dados["som"] = ""
         zf.writestr("config.json", json.dumps(dados, indent=4, ensure_ascii=False))
+    sal = os.urandom(16)
+    token = Fernet(_chave_backup(senha, sal)).encrypt(memoria.getvalue())
+    with open(destino, "wb") as f:
+        f.write(MAGICO_BACKUP + sal + token)
 
 
-def importar_backup(origem):
-    """Restaura um backup gerado por exportar_backup. Lança ValueError se o arquivo for inválido."""
-    with zipfile.ZipFile(origem) as zf:
+def importar_backup(origem, senha=None):
+    """Restaura um backup (.a2ubak criptografado, ou .zip antigo sem criptografia).
+    Lança ValueError se o arquivo for inválido ou a senha estiver errada."""
+    if backup_criptografado(origem):
+        with open(origem, "rb") as f:
+            conteudo = f.read()
+        sal = conteudo[len(MAGICO_BACKUP):len(MAGICO_BACKUP) + 16]
+        try:
+            arquivo_zip = io.BytesIO(Fernet(_chave_backup(senha or "", sal)).decrypt(
+                conteudo[len(MAGICO_BACKUP) + 16:]))
+        except InvalidToken:
+            raise ValueError("Senha do backup incorreta (ou arquivo corrompido).")
+    elif zipfile.is_zipfile(origem):
+        arquivo_zip = origem
+    else:
+        raise ValueError("Este arquivo não é um backup do Alerta2UI.")
+
+    with zipfile.ZipFile(arquivo_zip) as zf:
         try:
             dados = json.loads(zf.read("config.json").decode("utf-8"))
         except KeyError:
@@ -734,6 +837,45 @@ def importar_backup(origem):
     salvar_config()
     configurar_startup_windows(config.get("iniciar_windows", False))
     reconstruir_lista()
+
+
+def pedir_senha_backup(pai, criando):
+    """Janela modal que pede a senha do backup. Retorna a senha, ou None se cancelar."""
+    resultado = {"senha": None}
+    janela = ctk.CTkToplevel(pai)
+    preparar_janela(janela, "Senha do backup", "360x290" if criando else "360x220")
+    texto = ("Crie uma senha para proteger o backup.\nEla será pedida ao restaurar."
+             if criando else "Digite a senha deste backup:")
+    ctk.CTkLabel(janela, text="🔒 " + texto, font=("Arial", 13, "bold"), justify="left").pack(pady=(18, 10))
+    e_senha = ctk.CTkEntry(janela, show="*", width=260, placeholder_text="Senha do backup")
+    e_senha.pack(pady=4)
+    e_conf = None
+    if criando:
+        e_conf = ctk.CTkEntry(janela, show="*", width=260, placeholder_text="Confirme a senha")
+        e_conf.pack(pady=4)
+    lbl_erro = ctk.CTkLabel(janela, text="", text_color=COR_OFFLINE)
+    lbl_erro.pack()
+    janela.after(200, e_senha.focus_set)
+
+    def confirmar(event=None):
+        senha = e_senha.get()
+        if criando and len(senha) < 4:
+            lbl_erro.configure(text="Use pelo menos 4 caracteres.")
+            return
+        if criando and senha != e_conf.get():
+            lbl_erro.configure(text="As senhas não conferem.")
+            return
+        resultado["senha"] = senha
+        janela.destroy()
+
+    janela.bind("<Return>", confirmar)
+    ctk.CTkButton(janela, text="Confirmar", width=260, command=confirmar).pack(pady=10)
+    pai.wait_window(janela)
+    try:
+        pai.grab_set()  # devolve o foco modal para a janela de configurações
+    except Exception:
+        pass
+    return resultado["senha"]
 
 
 def abrir_configuracoes():
@@ -815,15 +957,19 @@ def abrir_configuracoes():
     linha_backup.pack(fill="x", padx=20)
 
     def acao_exportar():
+        senha = pedir_senha_backup(janela, criando=True)
+        if senha is None:
+            return
         janela.attributes("-topmost", False)
         destino = filedialog.asksaveasfilename(
-            parent=janela, defaultextension=".zip", filetypes=[("Backup Alerta2UI", "*.zip")],
-            initialfile=f"Alerta2UI_backup_{date.today():%Y-%m-%d}.zip")
+            parent=janela, defaultextension=EXTENSAO_BACKUP,
+            filetypes=[("Backup Alerta2UI", "*" + EXTENSAO_BACKUP)],
+            initialfile=f"Alerta2UI_backup_{date.today():%Y-%m-%d}{EXTENSAO_BACKUP}")
         janela.attributes("-topmost", True)
         if not destino:
             return
         try:
-            exportar_backup(destino)
+            exportar_backup(destino, senha)
             messagebox.showinfo("Backup", f"Backup salvo em:\n{destino}", parent=janela)
         except Exception as e:
             logging.error(f"Falha ao exportar backup: {e}")
@@ -831,7 +977,8 @@ def abrir_configuracoes():
 
     def acao_importar():
         janela.attributes("-topmost", False)
-        origem = filedialog.askopenfilename(parent=janela, filetypes=[("Backup Alerta2UI", "*.zip")])
+        origem = filedialog.askopenfilename(
+            parent=janela, filetypes=[("Backup Alerta2UI", f"*{EXTENSAO_BACKUP} *.zip")])
         janela.attributes("-topmost", True)
         if not origem:
             return
@@ -840,8 +987,13 @@ def abrir_configuracoes():
                 "Isso vai SUBSTITUIR todos os dispositivos, configurações e a senha atuais "
                 "pelos do backup.\n\nDeseja continuar?", parent=janela):
             return
+        senha = None
         try:
-            importar_backup(origem)
+            if backup_criptografado(origem):
+                senha = pedir_senha_backup(janela, criando=False)
+                if senha is None:
+                    return
+            importar_backup(origem, senha)
         except Exception as e:
             logging.error(f"Falha ao importar backup: {e}")
             messagebox.showerror("Backup", f"Não foi possível restaurar o backup:\n{e}", parent=janela)
@@ -855,7 +1007,7 @@ def abrir_configuracoes():
                   command=acao_importar).pack(side="left", padx=8)
 
     sw_windows = ctk.CTkSwitch(janela, text="Iniciar com o Windows")
-    if config.get("iniciar_windows"):
+    if startup_windows_ativo():  # lê o registro: o instalador também pode ter ativado
         sw_windows.select()
     sw_windows.pack(anchor="w", padx=20, pady=14)
 

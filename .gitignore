@@ -1,6 +1,7 @@
 # Arquivos gerados pelo PyInstaller
 build/
 dist/
+instalador/
 
 # Python
 __pycache__/

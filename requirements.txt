@@ -4,3 +4,4 @@ pystray
 Pillow
 pycaw
 comtypes
+cryptography
