@@ -1,0 +1,12 @@
+# Arquivos gerados pelo PyInstaller
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Configurações locais do editor / Claude Code
+.claude/
+.vscode/
